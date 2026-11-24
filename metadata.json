@@ -1,0 +1,6 @@
+{
+  "name": "PingGate",
+  "description": "Ứng dụng tối ưu mạng game và định tuyến Split-Tunneling theo mô hình BYON sử dụng lõi sing-box.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
