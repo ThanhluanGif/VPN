@@ -3,6 +3,7 @@ import { Download, Menu, Shield, X } from 'lucide-react';
 
 interface NavbarProps {
   onDownloadClick: () => void;
+  downloadLabel?: string;
 }
 
 const NAV_LINKS = [
@@ -12,7 +13,7 @@ const NAV_LINKS = [
   { href: '#download', label: 'Tải ứng dụng' },
 ];
 
-export function Navbar({ onDownloadClick }: NavbarProps) {
+export function Navbar({ onDownloadClick, downloadLabel = 'Tải ứng dụng' }: NavbarProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
@@ -53,7 +54,7 @@ export function Navbar({ onDownloadClick }: NavbarProps) {
             className="inline-flex h-10 items-center gap-2 rounded-lg bg-indigo-500 px-4 text-xs sm:text-sm font-semibold text-white hover:bg-indigo-400 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-400"
           >
             <Download className="h-4 w-4" aria-hidden="true" />
-            <span>Tải ứng dụng</span>
+            <span>{downloadLabel}</span>
           </button>
 
           <button

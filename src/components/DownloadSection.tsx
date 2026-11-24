@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -9,16 +9,18 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { LocalAgentHealth } from '../lib/localBridge';
+import type { DesktopPlatform, DetectedDevice } from '../lib/platformDetect';
 import type { ProxyNode, RoutingProfile } from '../types/network';
 import { collectActiveRoutingTargets } from '../lib/configBuilder';
 
 interface DownloadSectionProps {
   activeNode: ProxyNode | null;
   routing: RoutingProfile;
+  detectedDevice: DetectedDevice;
   agentHealth: LocalAgentHealth | null;
   isProbingAgent: boolean;
   agentNotice: { type: 'info' | 'error' | 'success'; text: string } | null;
-  onDownloadInstaller: (platform: 'windows' | 'macos') => void;
+  onDownloadInstaller: (platform: DesktopPlatform) => void;
   onDownloadConfigOnly: () => void;
   onProbeAgent: () => void;
 }
@@ -26,6 +28,7 @@ interface DownloadSectionProps {
 export function DownloadSection({
   activeNode,
   routing,
+  detectedDevice,
   agentHealth,
   isProbingAgent,
   agentNotice,
@@ -33,8 +36,20 @@ export function DownloadSection({
   onDownloadConfigOnly,
   onProbeAgent,
 }: DownloadSectionProps) {
-  const [platform, setPlatform] = useState<'windows' | 'macos'>('windows');
+  const [platform, setPlatform] = useState<DesktopPlatform>(detectedDevice.recommendedBundle);
+  const [userOverrodeOs, setUserOverrodeOs] = useState(false);
   const targets = collectActiveRoutingTargets(routing);
+
+  useEffect(() => {
+    if (!userOverrodeOs) {
+      setPlatform(detectedDevice.recommendedBundle);
+    }
+  }, [detectedDevice.recommendedBundle, userOverrodeOs]);
+
+  function handleSelectPlatform(next: DesktopPlatform) {
+    setUserOverrodeOs(true);
+    setPlatform(next);
+  }
 
   return (
     <section
@@ -65,6 +80,17 @@ export function DownloadSection({
                 </p>
               </div>
 
+              {/* Auto-detected machine info */}
+              <div className="flex items-start gap-2 text-xs text-slate-300">
+                <CheckCircle2
+                  className={`h-4 w-4 shrink-0 mt-0.5 ${
+                    detectedDevice.isDesktopSupported ? 'text-emerald-400' : 'text-amber-400'
+                  }`}
+                  aria-hidden="true"
+                />
+                <span>{detectedDevice.compatibilityNote}</span>
+              </div>
+
               {/* OS Selector Tabs */}
               <div
                 role="tablist"
@@ -75,7 +101,7 @@ export function DownloadSection({
                   type="button"
                   role="tab"
                   aria-selected={platform === 'windows'}
-                  onClick={() => setPlatform('windows')}
+                  onClick={() => handleSelectPlatform('windows')}
                   className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-colors whitespace-nowrap ${
                     platform === 'windows'
                       ? 'bg-indigo-500 text-white'
@@ -83,13 +109,16 @@ export function DownloadSection({
                   }`}
                 >
                   <Monitor className="h-4 w-4" aria-hidden="true" />
-                  <span>Windows 10 / 11</span>
+                  <span>
+                    Windows 10 / 11
+                    {detectedDevice.os === 'windows' ? ' (Máy này)' : ''}
+                  </span>
                 </button>
                 <button
                   type="button"
                   role="tab"
                   aria-selected={platform === 'macos'}
-                  onClick={() => setPlatform('macos')}
+                  onClick={() => handleSelectPlatform('macos')}
                   className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-colors whitespace-nowrap ${
                     platform === 'macos'
                       ? 'bg-indigo-500 text-white'
@@ -97,7 +126,10 @@ export function DownloadSection({
                   }`}
                 >
                   <Laptop className="h-4 w-4" aria-hidden="true" />
-                  <span>macOS</span>
+                  <span>
+                    macOS
+                    {detectedDevice.os === 'macos' ? ' (Máy này)' : ''}
+                  </span>
                 </button>
               </div>
 

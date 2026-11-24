@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowDownRight, Download } from 'lucide-react';
 import { CapabilitiesSection } from './components/CapabilitiesSection';
 import { DownloadSection } from './components/DownloadSection';
@@ -8,7 +8,7 @@ import { HeroClientCard } from './components/HeroClientCard';
 import { Navbar } from './components/Navbar';
 import { SplitTunnelSection } from './components/SplitTunnelSection';
 import { buildSingBoxConfig, formatSingBoxConfigJson } from './lib/configBuilder';
-import { downloadBinaryFile, downloadTextFile } from './lib/download';
+import { copyToClipboard, downloadBinaryFile, downloadTextFile } from './lib/download';
 import {
   measureRealPingViaAgent,
   probeLocalAgent,
@@ -17,10 +17,12 @@ import {
   type LocalAgentHealth,
 } from './lib/localBridge';
 import {
-  loadProfilesFromStorage,
-  measureDeterministicLatencyMs,
-  saveProfilesToStorage,
-} from './lib/profiles';
+  detectCurrentDevice,
+  refineDeviceWithHighEntropy,
+  type DesktopPlatform,
+  type DetectedDevice,
+} from './lib/platformDetect';
+import { loadProfilesFromStorage, saveProfilesToStorage } from './lib/profiles';
 import { buildDesktopBundleFiles } from './lib/pythonTemplates';
 import { parseProxyUri } from './lib/uriParser';
 import { createZipArchive } from './lib/zipBuilder';
@@ -31,22 +33,100 @@ import type {
   RoutingMode,
 } from './types/network';
 
+interface LiveServersResponse {
+  ok: boolean;
+  nodes?: ProxyNode[];
+  verifiedAt?: string;
+  error?: string;
+}
+
+interface BackendPingResponse {
+  ok: boolean;
+  results?: Array<{
+    id: string;
+    latencyMs: number | null;
+    resolvedIp: string | null;
+    reachable: boolean;
+  }>;
+  measuredAt?: string;
+}
+
 export default function App() {
   const [profiles, setProfiles] = useState<AppProfilesData>(() => loadProfilesFromStorage());
+  const [detectedDevice, setDetectedDevice] = useState<DetectedDevice>(() =>
+    detectCurrentDevice(),
+  );
+  const [liveNodes, setLiveNodes] = useState<ProxyNode[]>([]);
+  const [isLoadingLive, setIsLoadingLive] = useState(true);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [verifiedAt, setVerifiedAt] = useState<string | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [connectedSeconds, setConnectedSeconds] = useState(0);
   const [testingNodeIds, setTestingNodeIds] = useState<Record<string, boolean>>({});
   const [agentHealth, setAgentHealth] = useState<LocalAgentHealth | null>(null);
   const [isProbingAgent, setIsProbingAgent] = useState(false);
+  const [copiedNodeId, setCopiedNodeId] = useState<string | null>(null);
   const [agentNotice, setAgentNotice] = useState<{
     type: 'info' | 'error' | 'success';
     text: string;
   } | null>(null);
-  const pingAttemptRef = useRef(1);
+
+  useEffect(() => {
+    let active = true;
+    void refineDeviceWithHighEntropy().then((refined) => {
+      if (active) {
+        setDetectedDevice(refined);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     saveProfilesToStorage(profiles);
   }, [profiles]);
+
+  const fetchLiveNodes = useCallback(async (forceRefresh = false) => {
+    setIsLoadingLive(true);
+    setLiveError(null);
+    try {
+      const endpoint = forceRefresh ? '/api/servers/live?refresh=1' : '/api/servers/live';
+      const res = await fetch(endpoint, { signal: AbortSignal.timeout(25000) });
+      const data = (await res.json()) as LiveServersResponse;
+      if (!res.ok || !data.ok || !Array.isArray(data.nodes)) {
+        setLiveError(data.error || 'Không thể tải danh sách máy chủ đang hoạt động.');
+        return;
+      }
+      setLiveNodes(data.nodes);
+      setVerifiedAt(data.verifiedAt ?? new Date().toISOString());
+      if (data.nodes.length === 0) {
+        setLiveError(
+          'Tạm thời chưa tìm thấy node cộng đồng nào phản hồi TCP. Bạn có thể bấm Quét lại hoặc dán link VPS cá nhân.',
+        );
+      }
+    } catch {
+      setLiveError(
+        'Không kết nối được tới dịch vụ kiểm tra máy chủ. Vui lòng thử bấm Quét lại sau vài giây.',
+      );
+    } finally {
+      setIsLoadingLive(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchLiveNodes(false);
+  }, [fetchLiveNodes]);
+
+  const allNodes = useMemo(
+    () => [...profiles.nodes, ...liveNodes],
+    [profiles.nodes, liveNodes],
+  );
+
+  const activeNode = useMemo(
+    () => allNodes.find((n) => n.id === profiles.activeNodeId) ?? allNodes[0] ?? null,
+    [allNodes, profiles.activeNodeId],
+  );
 
   useEffect(() => {
     if (connectionState !== 'connected') {
@@ -59,9 +139,87 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [connectionState]);
 
-  const activeNode = useMemo(
-    () => profiles.nodes.find((n) => n.id === profiles.activeNodeId) ?? profiles.nodes[0] ?? null,
-    [profiles.nodes, profiles.activeNodeId],
+  const pingNodesReal = useCallback(
+    async (targets: ProxyNode[]) => {
+      if (targets.length === 0) return;
+      const flags: Record<string, boolean> = {};
+      for (const node of targets) {
+        flags[node.id] = true;
+      }
+      setTestingNodeIds((prev) => ({ ...prev, ...flags }));
+
+      const now = new Date().toISOString();
+      const latencyMap = new Map<string, { latencyMs: number | null; resolvedIp: string | null }>();
+
+      try {
+        if (agentHealth?.ok) {
+          const results = await Promise.all(
+            targets.map(async (node) => ({
+              id: node.id,
+              res: await measureRealPingViaAgent(node.server, node.port),
+            })),
+          );
+          for (const item of results) {
+            latencyMap.set(item.id, {
+              latencyMs: item.res.latencyMs,
+              resolvedIp: null,
+            });
+          }
+        } else {
+          const res = await fetch('/api/servers/ping', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              targets: targets.slice(0, 20).map((n) => ({
+                id: n.id,
+                server: n.server,
+                port: n.port,
+              })),
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as BackendPingResponse;
+            if (data.ok && Array.isArray(data.results)) {
+              for (const item of data.results) {
+                latencyMap.set(item.id, {
+                  latencyMs: item.latencyMs,
+                  resolvedIp: item.resolvedIp,
+                });
+              }
+            }
+          }
+        }
+
+        const applyUpdate = (list: ProxyNode[]) =>
+          list.map((node) => {
+            const hit = latencyMap.get(node.id);
+            if (!hit) return node;
+            return {
+              ...node,
+              latencyMs: hit.latencyMs,
+              exitIp: hit.resolvedIp ?? node.exitIp,
+              lastTestedAt: now,
+            };
+          });
+
+        setLiveNodes((prev) => applyUpdate(prev));
+        setProfiles((prev) => ({
+          ...prev,
+          nodes: applyUpdate(prev.nodes),
+        }));
+        setVerifiedAt(now);
+      } finally {
+        setTestingNodeIds((prev) => {
+          const next = { ...prev };
+          for (const node of targets) {
+            delete next[node.id];
+          }
+          return next;
+        });
+      }
+    },
+    [agentHealth?.ok],
   );
 
   async function connectToNode(targetNode: ProxyNode) {
@@ -79,30 +237,36 @@ export default function App() {
       return;
     }
 
-    setConnectionState('connecting');
-    window.setTimeout(() => {
-      setConnectionState('connected');
-    }, 380);
+    setAgentNotice({
+      type: 'info',
+      text: `Đã chọn máy chủ thật "${targetNode.name}" (${targetNode.exitIp || targetNode.server}:${targetNode.port}). Trình duyệt web không thể tự tạo card mạng TUN cho game trên Windows/macOS — hãy tải bộ cài PingGate bên dưới (đã nạp sẵn máy chủ này) hoặc sao chép link để chạy ngay trên máy tính.`,
+    });
   }
 
   async function handleToggleConnect() {
     if (!activeNode) return;
 
-    if (connectionState === 'connected') {
-      if (agentHealth?.ok) {
-        setConnectionState('disconnecting');
-        const res = await stopLocalAgentTunnel();
-        setConnectionState('disconnected');
+    if (!agentHealth?.ok) {
+      if (detectedDevice.os === 'linux') {
+        handleDownloadConfigOnly();
         setAgentNotice({
-          type: res.ok ? 'info' : 'error',
-          text: res.message,
+          type: 'info',
+          text: 'Đã nhận diện máy chạy Linux — đã xuất sẵn tệp config.json kèm máy chủ đang chọn để bạn chạy trực tiếp bằng lệnh sing-box run -c config.json.',
         });
         return;
       }
+      handleDownloadInstaller(detectedDevice.recommendedBundle);
+      return;
+    }
+
+    if (connectionState === 'connected') {
       setConnectionState('disconnecting');
-      window.setTimeout(() => {
-        setConnectionState('disconnected');
-      }, 260);
+      const res = await stopLocalAgentTunnel();
+      setConnectionState('disconnected');
+      setAgentNotice({
+        type: res.ok ? 'info' : 'error',
+        text: res.message,
+      });
       return;
     }
 
@@ -111,14 +275,33 @@ export default function App() {
     }
   }
 
-  async function handleSelectAndConnect(nodeId: string) {
-    const target = profiles.nodes.find((n) => n.id === nodeId);
+  async function handleSelectNode(nodeId: string) {
+    const target = allNodes.find((n) => n.id === nodeId);
     if (!target) return;
     setProfiles((prev) => ({ ...prev, activeNodeId: nodeId }));
-    if (activeNode?.id === nodeId && connectionState === 'connected') {
+
+    if (agentHealth?.ok) {
+      if (activeNode?.id === nodeId && connectionState === 'connected') {
+        return;
+      }
+      await connectToNode(target);
       return;
     }
-    await connectToNode(target);
+
+    setAgentNotice({
+      type: 'info',
+      text: `Đã chọn "${target.name}" làm máy chủ mặc định cho bộ cài Desktop và tệp config.json.`,
+    });
+  }
+
+  async function handleCopyNodeUri(node: ProxyNode) {
+    const ok = await copyToClipboard(node.rawUri);
+    if (ok) {
+      setCopiedNodeId(node.id);
+      window.setTimeout(() => {
+        setCopiedNodeId((current) => (current === node.id ? null : current));
+      }, 2000);
+    }
   }
 
   async function handleProbeLocalAgent() {
@@ -132,25 +315,33 @@ export default function App() {
       }
       setAgentNotice({
         type: 'success',
-        text: `Đã kết nối thành công với ứng dụng PingGate trên máy tính (${res.health.platform}). Bạn có thể bật/tắt VPN thật ngay trên web.`,
+        text: `Đã liên kết với ứng dụng PingGate trên máy tính (${res.health.platform}). Bạn có thể bật/tắt VPN thật cho game ngay trên website này.`,
       });
     } else {
       setAgentHealth(null);
+      setConnectionState('disconnected');
       setAgentNotice({ type: 'error', text: res.error });
     }
   }
 
-  function handleDownloadInstaller(platform: 'windows' | 'macos') {
-    const entries = buildDesktopBundleFiles(profiles, activeNode, platform);
+  function handleDownloadInstaller(platform: DesktopPlatform) {
+    const bundleProfiles: AppProfilesData = {
+      ...profiles,
+      activeNodeId: activeNode?.id ?? null,
+      nodes: allNodes,
+    };
+    const entries = buildDesktopBundleFiles(bundleProfiles, activeNode, platform);
     const zipBytes = createZipArchive(entries);
     const filename =
       platform === 'windows' ? 'PingGate-Setup-Windows.zip' : 'PingGate-Setup-macOS.zip';
     downloadBinaryFile(filename, zipBytes, 'application/zip');
     setAgentNotice({
       type: 'success',
-      text: `Đã tải ${filename} (kèm sẵn máy chủ ${activeNode?.name ?? 'mặc định'} và thiết lập game). Giải nén và nhấp đúp ${
+      text: `Đã tải ${filename} kèm ${allNodes.length} máy chủ đã kiểm tra TCP (mặc định: ${
+        activeNode?.name ?? 'tự chọn'
+      }). Giải nén và nhấp đúp ${
         platform === 'windows' ? 'PingGate-Windows.bat' : 'PingGate-macOS.command'
-      } để cài đặt tự động.`,
+      } để chạy sing-box TUN thật trên máy tính.`,
     });
   }
 
@@ -167,16 +358,16 @@ export default function App() {
     const newNode: ProxyNode = {
       ...parsed.node,
       isFreeTier: false,
-      loadPercent: 18,
     };
     setProfiles((prev) => ({
       ...prev,
       activeNodeId: newNode.id,
       nodes: [newNode, ...prev.nodes],
     }));
+    void pingNodesReal([newNode]);
     return {
       ok: true,
-      message: `Đã thêm máy chủ cá nhân "${newNode.name}" (${newNode.protocol.toUpperCase()}).`,
+      message: `Đã thêm máy chủ "${newNode.name}" (${newNode.protocol.toUpperCase()}) và đang đo TCP thực tế...`,
     };
   }
 
@@ -184,10 +375,9 @@ export default function App() {
     setProfiles((prev) => {
       const remaining = prev.nodes.filter((n) => n.id !== nodeId);
       const nextActive =
-        prev.activeNodeId === nodeId ? (remaining[0]?.id ?? null) : prev.activeNodeId;
-      if (remaining.length === 0) {
-        setConnectionState('disconnected');
-      }
+        prev.activeNodeId === nodeId
+          ? (remaining[0]?.id ?? liveNodes[0]?.id ?? null)
+          : prev.activeNodeId;
       return {
         ...prev,
         activeNodeId: nextActive,
@@ -197,51 +387,11 @@ export default function App() {
   }
 
   async function handleTestAllPings() {
-    if (profiles.nodes.length === 0) return;
-    const allFlags: Record<string, boolean> = {};
-    for (const node of profiles.nodes) {
-      allFlags[node.id] = true;
-    }
-    setTestingNodeIds(allFlags);
-
-    if (agentHealth?.ok) {
-      const results = await Promise.all(
-        profiles.nodes.map(async (node) => ({
-          id: node.id,
-          res: await measureRealPingViaAgent(node.server, node.port),
-        })),
-      );
-      const map = new Map(results.map((r) => [r.id, r.res.latencyMs]));
-      const now = new Date().toISOString();
-      setProfiles((prev) => ({
-        ...prev,
-        nodes: prev.nodes.map((node) => ({
-          ...node,
-          latencyMs: map.get(node.id) ?? null,
-          lastTestedAt: now,
-        })),
-      }));
-      setTestingNodeIds({});
-      return;
-    }
-
-    const attempt = pingAttemptRef.current++;
-    window.setTimeout(() => {
-      const now = new Date().toISOString();
-      setProfiles((prev) => ({
-        ...prev,
-        nodes: prev.nodes.map((node, index) => ({
-          ...node,
-          latencyMs: measureDeterministicLatencyMs(node, attempt + index),
-          lastTestedAt: now,
-        })),
-      }));
-      setTestingNodeIds({});
-    }, 420);
+    await pingNodesReal(allNodes);
   }
 
   function handleSelectLowestPing() {
-    const measured = profiles.nodes.filter((n) => n.latencyMs !== null);
+    const measured = allNodes.filter((n) => n.latencyMs !== null);
     if (measured.length === 0) return;
     const best = measured.reduce((min, cur) =>
       (cur.latencyMs ?? Infinity) < (min.latencyMs ?? Infinity) ? cur : min,
@@ -307,64 +457,87 @@ export default function App() {
     }
   }
 
+  const liveAliveCount = allNodes.filter((n) => n.latencyMs !== null).length;
+
   return (
     <div id="top" className="min-h-screen bg-[#0B0D14] text-slate-100">
-      <Navbar onDownloadClick={scrollToDownload} />
+      <Navbar
+        onDownloadClick={scrollToDownload}
+        downloadLabel={detectedDevice.shortDownloadLabel}
+      />
 
       <main>
         {/* Proton-inspired Split Hero Section */}
         <section className="relative overflow-hidden py-14 sm:py-20 lg:py-24">
           <div className="mx-auto max-w-[1200px] px-4 sm:px-6 lg:px-8">
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-12 items-center">
-              {/* Left Column: Clear Value Proposition & Single Primary CTA */}
+              {/* Left Column: Clear Value Proposition & Auto-Detected Primary CTA */}
               <div className="lg:col-span-6 space-y-6">
                 <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-white leading-[1.1] text-balance">
-                  Giảm ping game, kết nối mượt chỉ với 1 chạm
+                  Giảm ping game, tách luồng mượt bằng sing-box TUN
                 </h1>
                 <p className="text-base sm:text-lg text-slate-300 leading-relaxed max-w-xl">
-                  Chọn sẵn máy chủ miễn phí tại Singapore, Hong Kong, Nhật Bản để chơi Roblox, Genshin Impact hay Valorant mượt mà — trong khi giữ nguyên tốc độ mạng nội địa cho trình duyệt và Discord.
+                  Tự động quét và kiểm tra TCP thực tế các máy chủ miễn phí còn sống, hỗ trợ dán link VPS riêng và nạp thẳng vào bộ cài Desktop để định tuyến riêng game (Roblox, Valorant, Genshin Impact) mà không làm chậm trình duyệt hay Discord.
                 </p>
 
                 <div className="flex flex-wrap items-center gap-4 pt-1">
                   <button
                     type="button"
-                    onClick={() => handleDownloadInstaller('windows')}
+                    onClick={() => {
+                      if (detectedDevice.os === 'linux') {
+                        handleDownloadConfigOnly();
+                      } else {
+                        handleDownloadInstaller(detectedDevice.recommendedBundle);
+                      }
+                    }}
                     className="inline-flex h-12 items-center gap-2.5 rounded-xl bg-indigo-500 px-6 text-sm font-semibold text-white hover:bg-indigo-400 transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-400"
                   >
                     <Download className="h-4 w-4" aria-hidden="true" />
-                    <span>Tải PingGate cho Windows</span>
+                    <span>{detectedDevice.ctaLabel}</span>
                   </button>
                   <a
                     href="#download"
                     className="inline-flex h-12 items-center gap-1.5 px-2 text-sm font-medium text-slate-300 hover:text-white transition-colors whitespace-nowrap"
                   >
-                    <span>Phiên bản macOS & hướng dẫn</span>
+                    <span>{detectedDevice.otherPlatformLabel}</span>
                     <ArrowDownRight className="h-4 w-4" aria-hidden="true" />
                   </a>
                 </div>
 
                 {/* Unboxed quiet metadata trust line (Zero-Pill Discipline) */}
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-2 text-xs text-slate-400">
-                  <span>6 máy chủ Châu Á sẵn sàng</span>
+                  <span>Tự nhận diện: {detectedDevice.osLabel}</span>
                   <span aria-hidden="true">·</span>
-                  <span>Không cần đăng ký tài khoản</span>
+                  <span>
+                    {isLoadingLive
+                      ? 'Đang kiểm tra TCP máy chủ trực tiếp...'
+                      : `${liveAliveCount} máy chủ đã xác thực TCP sống`}
+                  </span>
                   <span aria-hidden="true">·</span>
-                  <span>Hỗ trợ Windows & macOS</span>
+                  <span>Windows & macOS</span>
                 </div>
               </div>
 
-              {/* Right Column: Interactive Proton-style 1-Click VPN Client Widget */}
+              {/* Right Column: Honest Live Server Control Widget */}
               <div className="lg:col-span-6">
                 <HeroClientCard
-                  nodes={profiles.nodes}
+                  nodes={allNodes}
                   activeNode={activeNode}
                   routing={profiles.routing}
                   connectionState={connectionState}
                   connectedSeconds={connectedSeconds}
                   agentHealth={agentHealth}
                   isProbingAgent={isProbingAgent}
+                  isLoadingLive={isLoadingLive}
+                  copiedNodeId={copiedNodeId}
+                  recommendedPlatformLabel={
+                    detectedDevice.os === 'linux'
+                      ? 'Xuất config.json'
+                      : detectedDevice.shortDownloadLabel
+                  }
                   onToggleConnect={handleToggleConnect}
-                  onSelectAndConnect={handleSelectAndConnect}
+                  onSelectNode={handleSelectNode}
+                  onCopyNodeUri={handleCopyNodeUri}
                   onProbeAgent={handleProbeLocalAgent}
                 />
               </div>
@@ -373,14 +546,21 @@ export default function App() {
         </section>
 
         <FreeServersSection
-          nodes={profiles.nodes}
+          nodes={allNodes}
           activeNodeId={activeNode?.id ?? null}
           connectionState={connectionState}
+          agentConnected={Boolean(agentHealth?.ok)}
           testingNodeIds={testingNodeIds}
-          onSelectAndConnect={handleSelectAndConnect}
+          isLoadingLive={isLoadingLive}
+          liveError={liveError}
+          verifiedAt={verifiedAt}
+          copiedNodeId={copiedNodeId}
+          onSelectNode={handleSelectNode}
+          onCopyNodeUri={handleCopyNodeUri}
           onDeleteNode={handleDeleteNode}
           onAddUri={handleAddUri}
           onTestAllPings={handleTestAllPings}
+          onRefreshLiveNodes={() => void fetchLiveNodes(true)}
           onSelectLowestPing={handleSelectLowestPing}
         />
 
@@ -398,6 +578,7 @@ export default function App() {
         <DownloadSection
           activeNode={activeNode}
           routing={profiles.routing}
+          detectedDevice={detectedDevice}
           agentHealth={agentHealth}
           isProbingAgent={isProbingAgent}
           agentNotice={agentNotice}

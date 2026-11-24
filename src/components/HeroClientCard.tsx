@@ -1,5 +1,8 @@
 import {
+  Check,
   CheckCircle2,
+  Copy,
+  Download,
   Globe,
   Laptop,
   Loader2,
@@ -24,8 +27,12 @@ interface HeroClientCardProps {
   connectedSeconds: number;
   agentHealth: LocalAgentHealth | null;
   isProbingAgent: boolean;
+  isLoadingLive: boolean;
+  copiedNodeId: string | null;
+  recommendedPlatformLabel: string;
   onToggleConnect: () => void;
-  onSelectAndConnect: (nodeId: string) => void;
+  onSelectNode: (nodeId: string) => void;
+  onCopyNodeUri: (node: ProxyNode) => void;
   onProbeAgent: () => void;
 }
 
@@ -44,15 +51,21 @@ export function HeroClientCard({
   connectedSeconds,
   agentHealth,
   isProbingAgent,
+  isLoadingLive,
+  copiedNodeId,
+  recommendedPlatformLabel,
   onToggleConnect,
-  onSelectAndConnect,
+  onSelectNode,
+  onCopyNodeUri,
   onProbeAgent,
 }: HeroClientCardProps) {
-  const isConnected = connectionState === 'connected';
+  const isAgentReady = Boolean(agentHealth?.ok);
+  const isConnected = isAgentReady && connectionState === 'connected';
   const isBusy = connectionState === 'connecting' || connectionState === 'disconnecting';
   const targets = collectActiveRoutingTargets(routing);
   const tier = getLatencyTier(activeNode?.latencyMs ?? null);
   const quickNodes = nodes.slice(0, 3);
+  const isCopied = Boolean(activeNode && copiedNodeId === activeNode.id);
 
   const pingColor =
     tier.tone === 'good'
@@ -65,7 +78,7 @@ export function HeroClientCard({
 
   return (
     <div
-      aria-label="Bảng điều khiển kết nối nhanh PingGate"
+      aria-label="Bảng chọn máy chủ thật và điều khiển PingGate"
       className="rounded-2xl border border-white/[0.1] bg-[#131722] overflow-hidden shadow-2xl shadow-black/40"
     >
       {/* App Window Top Strip */}
@@ -73,15 +86,19 @@ export function HeroClientCard({
         <div className="flex items-center gap-2 text-xs font-medium text-slate-200 min-w-0">
           {isConnected ? (
             <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0" aria-hidden="true" />
+          ) : isLoadingLive ? (
+            <Loader2 className="h-4 w-4 animate-spin text-indigo-400 shrink-0" aria-hidden="true" />
           ) : (
-            <Globe className="h-4 w-4 text-slate-400 shrink-0" aria-hidden="true" />
+            <Globe className="h-4 w-4 text-indigo-400 shrink-0" aria-hidden="true" />
           )}
           <span className="truncate">
             {isConnected
-              ? agentHealth?.ok
-                ? 'Đã bảo vệ (Ứng dụng máy tính)'
-                : 'Đã kết nối nhanh (Xem trước)'
-              : 'Chưa kết nối'}
+              ? `Đang bật TUN thật (${agentHealth?.platform})`
+              : isAgentReady
+                ? `Sẵn sàng bật VPN thật (${agentHealth?.platform})`
+                : isLoadingLive
+                  ? 'Đang kiểm tra TCP máy chủ sống...'
+                  : 'Cần mở ứng dụng máy tính để chạy TUN thật'}
           </span>
         </div>
         <span className="text-xs text-slate-400 whitespace-nowrap shrink-0">
@@ -89,73 +106,95 @@ export function HeroClientCard({
         </span>
       </div>
 
-      {/* Main 1-Click Connect Panel */}
+      {/* Main Active Server & Action Panel */}
       <div className="p-6 space-y-6">
         <div className="flex flex-col sm:flex-row items-center justify-between gap-5">
-          <div className="text-center sm:text-left min-w-0">
-            <p className="text-xs text-slate-400">Máy chủ đang chọn</p>
+          <div className="text-center sm:text-left min-w-0 flex-1">
+            <p className="text-xs text-slate-400">Máy chủ thật đang chọn</p>
             <h2 className="mt-1 text-xl font-bold text-white truncate">
-              {activeNode?.name ?? 'Chưa có máy chủ'}
+              {isLoadingLive && !activeNode
+                ? 'Đang quét máy chủ...'
+                : activeNode?.name ?? 'Chưa có máy chủ'}
             </h2>
-            <p className="mt-1 text-xs text-slate-400">
+            <p className="mt-1 flex flex-wrap items-center justify-center sm:justify-start gap-x-1.5 gap-y-0.5 text-xs text-slate-400">
               {activeNode ? (
                 <>
                   <span>{activeNode.region}</span>
-                  <span className="mx-1.5" aria-hidden="true">
-                    ·
+                  <span aria-hidden="true">·</span>
+                  <span className="uppercase">
+                    {activeNode.protocol === 'shadowsocks' ? 'SS' : activeNode.protocol}
                   </span>
-                  <span className="uppercase">{activeNode.protocol}</span>
-                  <span className="mx-1.5" aria-hidden="true">
-                    ·
-                  </span>
-                  <span className={`font-mono font-semibold tabular-nums ${pingColor}`}>
-                    {activeNode.latencyMs !== null ? `${activeNode.latencyMs} ms` : 'Chưa đo'}
+                  <span aria-hidden="true">·</span>
+                  <span className={`font-mono font-semibold tabular-nums whitespace-nowrap ${pingColor}`}>
+                    {activeNode.latencyMs !== null ? `${activeNode.latencyMs} ms` : 'Chưa phản hồi'}
                   </span>
                 </>
               ) : (
-                'Chọn 1 máy chủ miễn phí bên dưới'
+                'Đang tải danh sách máy chủ cộng đồng...'
               )}
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={onToggleConnect}
-            disabled={isBusy || !activeNode}
-            aria-pressed={isConnected}
-            className={`inline-flex h-12 min-w-[168px] items-center justify-center gap-2.5 rounded-xl px-5 text-sm font-semibold transition-colors duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-400 disabled:opacity-60 ${
-              isConnected
-                ? 'bg-emerald-600 text-white hover:bg-emerald-500'
-                : 'bg-indigo-500 text-white hover:bg-indigo-400'
-            }`}
-          >
-            {isBusy ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <Power className="h-4 w-4" aria-hidden="true" />
+          <div className="flex items-center gap-2 shrink-0">
+            {activeNode && (
+              <button
+                type="button"
+                onClick={() => onCopyNodeUri(activeNode)}
+                title="Sao chép đường dẫn máy chủ thật để dùng ngay"
+                className="inline-flex h-12 items-center justify-center gap-1.5 rounded-xl border border-white/[0.1] bg-[#0E111B] px-3.5 text-xs font-semibold text-slate-200 hover:bg-white/[0.08] transition-colors whitespace-nowrap"
+              >
+                {isCopied ? (
+                  <Check className="h-4 w-4 text-emerald-400" aria-hidden="true" />
+                ) : (
+                  <Copy className="h-4 w-4 text-slate-300" aria-hidden="true" />
+                )}
+                <span>{isCopied ? 'Đã chép' : 'Chép link'}</span>
+              </button>
             )}
-            <span>
-              {connectionState === 'connected'
-                ? 'Ngắt kết nối'
-                : connectionState === 'connecting'
-                  ? 'Đang kết nối...'
-                  : connectionState === 'disconnecting'
-                    ? 'Đang ngắt...'
-                    : 'Kết nối nhanh'}
-            </span>
-          </button>
+
+            <button
+              type="button"
+              onClick={onToggleConnect}
+              disabled={isBusy || !activeNode}
+              aria-pressed={isConnected}
+              className={`inline-flex h-12 min-w-[152px] items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition-colors duration-150 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-400 disabled:opacity-60 ${
+                isConnected
+                  ? 'bg-emerald-600 text-white hover:bg-emerald-500'
+                  : 'bg-indigo-500 text-white hover:bg-indigo-400'
+              }`}
+            >
+              {isBusy ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              ) : isAgentReady ? (
+                <Power className="h-4 w-4" aria-hidden="true" />
+              ) : (
+                <Download className="h-4 w-4" aria-hidden="true" />
+              )}
+              <span>
+                {!isAgentReady
+                  ? recommendedPlatformLabel
+                  : connectionState === 'connected'
+                    ? 'Ngắt kết nối'
+                    : connectionState === 'connecting'
+                      ? 'Đang kết nối...'
+                      : connectionState === 'disconnecting'
+                        ? 'Đang ngắt...'
+                        : 'Kết nối thật'}
+              </span>
+            </button>
+          </div>
         </div>
 
-        {/* Clean 3-Column Connection Telemetry */}
+        {/* Real Verified Telemetry (No Fabricated Local/Exit IP) */}
         <div className="grid grid-cols-3 border-y border-white/[0.07] py-4 divide-x divide-white/[0.07]">
           <div className="pr-3">
-            <p className="text-xs text-slate-400">IP đầu ra</p>
+            <p className="text-xs text-slate-400">IP máy chủ xác thực</p>
             <p className="mt-1 font-mono text-xs sm:text-sm font-semibold tabular-nums text-slate-100 truncate">
-              {isConnected && activeNode ? activeNode.exitIp : '113.161.48.20'}
+              {activeNode?.exitIp || activeNode?.server || '—'}
             </p>
           </div>
           <div className="px-3">
-            <p className="text-xs text-slate-400">Độ trễ</p>
+            <p className="text-xs text-slate-400">TCP Ping thật</p>
             <p className={`mt-1 font-mono text-xs sm:text-sm font-semibold tabular-nums ${pingColor}`}>
               {activeNode?.latencyMs !== null && activeNode?.latencyMs !== undefined
                 ? `${activeNode.latencyMs} ms`
@@ -164,7 +203,7 @@ export function HeroClientCard({
           </div>
           <div className="pl-3">
             <p className="text-xs text-slate-400">
-              {isConnected ? 'Thời gian' : 'Định tuyến'}
+              {isConnected ? 'Thời gian bật' : 'Định tuyến'}
             </p>
             <p className="mt-1 font-mono text-xs sm:text-sm font-semibold tabular-nums text-slate-100 truncate">
               {isConnected
@@ -176,10 +215,10 @@ export function HeroClientCard({
           </div>
         </div>
 
-        {/* Quick Free VPS List Inside App Widget */}
+        {/* Live Verified Quick Server List */}
         <div className="space-y-2.5">
           <div className="flex items-center justify-between text-xs">
-            <span className="font-medium text-slate-300">Máy chủ miễn phí đề xuất</span>
+            <span className="font-medium text-slate-300">Máy chủ sống nhanh nhất vừa đo</span>
             <a
               href="#servers"
               className="text-indigo-400 hover:text-indigo-300 transition-colors"
@@ -188,53 +227,74 @@ export function HeroClientCard({
             </a>
           </div>
           <div className="divide-y divide-white/[0.06] rounded-xl border border-white/[0.07] bg-[#0E111B]">
-            {quickNodes.map((node) => {
-              const selected = node.id === activeNode?.id;
-              const nodeTier = getLatencyTier(node.latencyMs);
-              const color =
-                nodeTier.tone === 'good'
-                  ? 'text-emerald-400'
-                  : nodeTier.tone === 'fair'
-                    ? 'text-amber-400'
-                    : 'text-slate-400';
+            {isLoadingLive && quickNodes.length === 0 ? (
+              <div className="px-4 py-6 text-center text-xs text-slate-400">
+                Đang kiểm tra kết nối TCP tới các máy chủ công cộng...
+              </div>
+            ) : quickNodes.length === 0 ? (
+              <div className="px-4 py-6 text-center text-xs text-slate-400">
+                Chưa có máy chủ nào. Kéo xuống mục Máy chủ để quét lại hoặc dán link VPS của bạn.
+              </div>
+            ) : (
+              quickNodes.map((node) => {
+                const selected = node.id === activeNode?.id;
+                const nodeTier = getLatencyTier(node.latencyMs);
+                const color =
+                  nodeTier.tone === 'good'
+                    ? 'text-emerald-400'
+                    : nodeTier.tone === 'fair'
+                      ? 'text-amber-400'
+                      : nodeTier.tone === 'high'
+                        ? 'text-red-400'
+                        : 'text-slate-400';
 
-              return (
-                <div
-                  key={node.id}
-                  className="flex items-center justify-between gap-3 px-4 py-2.5"
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-slate-100 truncate">
-                      {node.name}
-                    </p>
-                    <p className="text-xs text-slate-400">
-                      {node.region} · Tải{' '}
-                      <span className="font-mono tabular-nums">
-                        {node.loadPercent ?? 35}%
+                return (
+                  <div
+                    key={node.id}
+                    className="flex items-center justify-between gap-3 px-4 py-2.5"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-slate-100 truncate">
+                        {node.name}
+                      </p>
+                      <p className="text-xs text-slate-400 truncate">
+                        <span className="uppercase">{node.protocol}</span>
+                        <span className="mx-1.5" aria-hidden="true">
+                          ·
+                        </span>
+                        <span className="font-mono text-slate-500">
+                          {node.exitIp || node.server}:{node.port}
+                        </span>
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <span className={`font-mono text-xs font-semibold tabular-nums ${color}`}>
+                        {node.latencyMs !== null ? `${node.latencyMs} ms` : '—'}
                       </span>
-                    </p>
+                      <button
+                        type="button"
+                        onClick={() => onSelectNode(node.id)}
+                        className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                          selected && isConnected
+                            ? 'bg-emerald-500/15 text-emerald-300'
+                            : selected
+                              ? 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'
+                              : 'bg-white/[0.06] text-slate-200 hover:bg-white/[0.12]'
+                        }`}
+                      >
+                        {selected && isConnected
+                          ? 'Đang chạy'
+                          : isAgentReady
+                            ? 'Kết nối'
+                            : selected
+                              ? 'Đã chọn'
+                              : 'Chọn'}
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3 shrink-0">
-                    <span className={`font-mono text-xs font-semibold tabular-nums ${color}`}>
-                      {node.latencyMs !== null ? `${node.latencyMs} ms` : '—'}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => onSelectAndConnect(node.id)}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
-                        selected && isConnected
-                          ? 'bg-emerald-500/15 text-emerald-300'
-                          : selected
-                            ? 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'
-                            : 'bg-white/[0.06] text-slate-200 hover:bg-white/[0.12]'
-                      }`}
-                    >
-                      {selected && isConnected ? 'Đang chạy' : 'Kết nối'}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
         </div>
 

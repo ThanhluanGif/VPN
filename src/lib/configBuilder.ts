@@ -15,9 +15,23 @@ export interface SingBoxConfig {
   outbounds: Array<Record<string, unknown>>;
   route: {
     auto_detect_interface: boolean;
+    default_domain_resolver: string;
     final: string;
     rules: Array<Record<string, unknown>>;
   };
+}
+
+function parseDnsServerSpec(rawAddress: string): { type: 'https' | 'udp'; server: string } {
+  const trimmed = rawAddress.trim();
+  if (/^https:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      return { type: 'https', server: parsed.hostname || '1.1.1.1' };
+    } catch {
+      return { type: 'https', server: '1.1.1.1' };
+    }
+  }
+  return { type: 'udp', server: trimmed || '1.1.1.1' };
 }
 
 export function collectActiveRoutingTargets(routing: RoutingProfile): {
@@ -70,18 +84,15 @@ export function buildSingBoxConfig(
     : {
         type: 'vless',
         tag: 'proxy-outbound',
-        server: 'sg-node.example.com',
+        server: '1.1.1.1',
         server_port: 443,
         uuid: '00000000-0000-4000-8000-000000000000',
       };
 
-  const dnsRules: Array<Record<string, unknown>> = [
-    {
-      outbound: ['any'],
-      server: 'local-dns',
-    },
-  ];
+  const proxyDnsSpec = parseDnsServerSpec(routing.tun.proxyDns);
+  const localDnsSpec = parseDnsServerSpec(routing.tun.localDns);
 
+  const dnsRules: Array<Record<string, unknown>> = [];
   if (routing.mode === 'split' && domains.length > 0) {
     dnsRules.push({
       domain_suffix: domains,
@@ -89,16 +100,20 @@ export function buildSingBoxConfig(
     });
   }
 
-  const routeRules: Array<Record<string, unknown>> = [
+  const routeRules: Array<Record<string, unknown>> = [];
+  if (routing.tun.sniff) {
+    routeRules.push({ action: 'sniff' });
+  }
+  routeRules.push(
     {
       protocol: 'dns',
-      outbound: 'dns-out',
+      action: 'hijack-dns',
     },
     {
       ip_is_private: true,
       outbound: 'direct',
     },
-  ];
+  );
 
   if (routing.mode === 'split') {
     if (routing.bypassProcesses.length > 0) {
@@ -129,14 +144,15 @@ export function buildSingBoxConfig(
     dns: {
       servers: [
         {
+          type: proxyDnsSpec.type,
           tag: 'proxy-dns',
-          address: routing.tun.proxyDns,
+          server: proxyDnsSpec.server,
           detour: 'proxy-outbound',
         },
         {
+          type: localDnsSpec.type,
           tag: 'local-dns',
-          address: routing.tun.localDns,
-          detour: 'direct',
+          server: localDnsSpec.server,
         },
       ],
       rules: dnsRules,
@@ -147,14 +163,11 @@ export function buildSingBoxConfig(
       {
         type: 'tun',
         tag: 'tun-in',
-        interface_name: routing.tun.interfaceName,
         address: [routing.tun.address],
         mtu: routing.tun.mtu,
         auto_route: routing.tun.autoRoute,
         strict_route: routing.tun.strictRoute,
         stack: routing.tun.stack,
-        sniff: routing.tun.sniff,
-        sniff_override_destination: routing.tun.sniff,
       },
     ],
     outbounds: [
@@ -163,17 +176,10 @@ export function buildSingBoxConfig(
         type: 'direct',
         tag: 'direct',
       },
-      {
-        type: 'block',
-        tag: 'block',
-      },
-      {
-        type: 'dns',
-        tag: 'dns-out',
-      },
     ],
     route: {
       auto_detect_interface: true,
+      default_domain_resolver: 'local-dns',
       rules: routeRules,
       final: routing.mode === 'global' ? 'proxy-outbound' : 'direct',
     },

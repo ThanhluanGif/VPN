@@ -43,30 +43,13 @@ export function inferRegionFromLabel(name: string, server: string): string {
   return 'Quốc tế';
 }
 
-export function deriveDisplayExitIp(server: string, region: string): string {
+export function deriveDisplayExitIp(server: string, _region?: string): string {
+  const cleaned = server.trim().replace(/^\[|\]$/g, '');
   const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
-  if (ipv4Regex.test(server)) {
-    return server;
+  if (ipv4Regex.test(cleaned)) {
+    return cleaned;
   }
-  let hash = 0;
-  for (let i = 0; i < server.length; i += 1) {
-    hash = (hash * 31 + server.charCodeAt(i)) >>> 0;
-  }
-  const prefixMap: Record<string, [number, number]> = {
-    Singapore: [103, 152],
-    'Hong Kong': [45, 121],
-    'Nhật Bản': [139, 162],
-    'Hàn Quốc': [141, 164],
-    'Đài Loan': [104, 199],
-    'Hoa Kỳ': [64, 176],
-    'Đức': [138, 201],
-    'Việt Nam': [113, 161],
-    'Quốc tế': [172, 104],
-  };
-  const [a, b] = prefixMap[region] ?? [103, 152];
-  const c = (hash % 220) + 12;
-  const d = ((hash >>> 8) % 240) + 8;
-  return `${a}.${b}.${c}.${d}`;
+  return '';
 }
 
 function buildTransport(

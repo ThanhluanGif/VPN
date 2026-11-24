@@ -72,20 +72,43 @@ export const MACOS_ONE_CLICK_SH = `#!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "[PingGate] Dang chuan bi moi truong macOS/Linux..."
+pause_on_exit() {
+  local code=$?
+  if [ "$code" -ne 0 ]; then
+    echo ""
+    echo "[PingGate] Da xay ra loi (ma loi: $code)."
+    read -r -p "Nhan Enter de dong cua so..." _
+  fi
+}
+trap pause_on_exit EXIT
+
+echo "[PingGate] Dang chuan bi moi truong macOS..."
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "[LOI] Chua tim thay python3. Hay cai Python 3.11+ (brew install python)."
+  echo "[LOI] Chua tim thay python3. Hay cai Python 3.11+ (https://www.python.org/downloads/ hoac brew install python)."
   exit 1
 fi
 
-if ! python3 -c "import customtkinter" >/dev/null 2>&1; then
-  echo "[PingGate] Dang cai dat customtkinter..."
-  python3 -m pip install --user customtkinter
+if ! command -v curl >/dev/null 2>&1; then
+  echo "[LOI] Chua tim thay curl tren he thong."
+  exit 1
 fi
 
+# Tao moi truong ao cuc bo .venv de tranh loi PEP 668 va dam bao sudo python3 thay customtkinter
+VENV_DIR=".venv"
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+  echo "[PingGate] Dang tao moi truong Python cuc bo (.venv)..."
+  python3 -m venv "$VENV_DIR"
+fi
+
+if ! "$VENV_DIR/bin/python" -c "import customtkinter" >/dev/null 2>&1; then
+  echo "[PingGate] Dang cai dat thu vien giao dien customtkinter..."
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip certifi customtkinter
+fi
+
+# Dung curl goc cua macOS (xac thuc chung chi SSL bang macOS Keychain, tranh loi SSL cua python.org)
 if [ ! -f "bin/sing-box" ]; then
-  echo "[PingGate] Dang tai loi mang sing-box chinh thuc..."
+  echo "[PingGate] Dang tai loi mang sing-box chinh thuc tu GitHub..."
   mkdir -p bin
   OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
   ARCH_RAW="$(uname -m)"
@@ -94,18 +117,30 @@ if [ ! -f "bin/sing-box" ]; then
   else
     ARCH="amd64"
   fi
-  python3 - "$OS_NAME" "$ARCH" <<'PY'
-import json, pathlib, sys, tarfile, urllib.request
+
+  RELEASE_JSON="$(curl -fsSL -H "User-Agent: PingGate" "https://api.github.com/repos/SagerNet/sing-box/releases/latest")"
+  DOWNLOAD_URL="$(printf '%s' "$RELEASE_JSON" | "$VENV_DIR/bin/python" - "$OS_NAME" "$ARCH" <<'PY'
+import json, sys
 os_name, arch = sys.argv[1], sys.argv[2]
-req = urllib.request.Request("https://api.github.com/repos/SagerNet/sing-box/releases/latest", headers={"User-Agent": "PingGate"})
-with urllib.request.urlopen(req, timeout=20) as resp:
-    rel = json.loads(resp.read().decode("utf-8"))
+rel = json.load(sys.stdin)
 suffix = f"{os_name}-{arch}.tar.gz"
-asset = next((a for a in rel.get("assets", []) if a["name"].endswith(suffix)), None)
+asset = next(
+    (
+        a for a in rel.get("assets", [])
+        if a.get("name", "").endswith(suffix) and "legacy" not in a.get("name", "")
+    ),
+    None,
+)
 if not asset:
     raise SystemExit(f"Khong tim thay ban sing-box cho {suffix}")
+print(asset["browser_download_url"])
+PY
+)"
+
+  curl -fsSL -H "User-Agent: PingGate" "$DOWNLOAD_URL" -o "bin/sing-box.tar.gz"
+  "$VENV_DIR/bin/python" - <<'PY'
+import pathlib, tarfile
 archive = pathlib.Path("bin/sing-box.tar.gz")
-urllib.request.urlretrieve(asset["browser_download_url"], archive)
 with tarfile.open(archive, "r:gz") as tar:
     member = next(m for m in tar.getmembers() if m.name.endswith("/sing-box"))
     with tar.extractfile(member) as src, open("bin/sing-box", "wb") as dst:
@@ -113,10 +148,11 @@ with tarfile.open(archive, "r:gz") as tar:
 archive.unlink(missing_ok=True)
 PY
   chmod +x bin/sing-box
+  xattr -d com.apple.quarantine bin/sing-box 2>/dev/null || true
 fi
 
 echo "[PingGate] Nhap mat khau macOS (sudo) de khoi tao card mang ao TUN..."
-exec sudo python3 main_ui.py
+sudo "$VENV_DIR/bin/python" main_ui.py
 `;
 
 export const BUILD_EXE_BAT = `@echo off
@@ -452,14 +488,13 @@ def build_singbox_config(
     domains = sorted({d.strip().lower() for d in game_domains if d and d.strip()})
     bypasses = sorted({b.strip() for b in bypass_processes if b and b.strip()})
 
-    dns_rules: List[Dict[str, Any]] = [
-        {"outbound": ["any"], "server": "local-dns"},
-    ]
+    dns_rules: List[Dict[str, Any]] = []
     if split_tunnel and domains:
         dns_rules.append({"domain_suffix": domains, "server": "proxy-dns"})
 
     route_rules: List[Dict[str, Any]] = [
-        {"protocol": "dns", "outbound": "dns-out"},
+        {"action": "sniff"},
+        {"protocol": "dns", "action": "hijack-dns"},
         {"ip_is_private": True, "outbound": "direct"},
     ]
 
@@ -476,14 +511,15 @@ def build_singbox_config(
         "dns": {
             "servers": [
                 {
+                    "type": "https",
                     "tag": "proxy-dns",
-                    "address": "https://1.1.1.1/dns-query",
+                    "server": "1.1.1.1",
                     "detour": "proxy-outbound",
                 },
                 {
+                    "type": "udp",
                     "tag": "local-dns",
-                    "address": "1.1.1.1",
-                    "detour": "direct",
+                    "server": "1.1.1.1",
                 },
             ],
             "rules": dns_rules,
@@ -494,24 +530,20 @@ def build_singbox_config(
             {
                 "type": "tun",
                 "tag": "tun-in",
-                "interface_name": "pinggate-tun",
                 "address": ["172.19.0.1/30"],
                 "mtu": mtu,
                 "auto_route": True,
                 "strict_route": True,
                 "stack": tun_stack,
-                "sniff": True,
-                "sniff_override_destination": True,
             }
         ],
         "outbounds": [
             outbound_copy,
             {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"},
-            {"type": "dns", "tag": "dns-out"},
         ],
         "route": {
             "auto_detect_interface": True,
+            "default_domain_resolver": "local-dns",
             "rules": route_rules,
             "final": "direct" if split_tunnel else "proxy-outbound",
         },
