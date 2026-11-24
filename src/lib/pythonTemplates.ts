@@ -118,11 +118,11 @@ if [ ! -f "bin/sing-box" ]; then
     ARCH="amd64"
   fi
 
-  RELEASE_JSON="$(curl -fsSL -H "User-Agent: PingGate" "https://api.github.com/repos/SagerNet/sing-box/releases/latest")"
-  DOWNLOAD_URL="$(printf '%s' "$RELEASE_JSON" | "$VENV_DIR/bin/python" - "$OS_NAME" "$ARCH" <<'PY'
-import json, sys
-os_name, arch = sys.argv[1], sys.argv[2]
-rel = json.load(sys.stdin)
+  curl -fsSL -H "User-Agent: PingGate" "https://api.github.com/repos/SagerNet/sing-box/releases/latest" -o "bin/release.json"
+  DOWNLOAD_URL="$("$VENV_DIR/bin/python" - "bin/release.json" "$OS_NAME" "$ARCH" <<'PY'
+import json, pathlib, sys
+rel_path, os_name, arch = sys.argv[1], sys.argv[2], sys.argv[3]
+rel = json.loads(pathlib.Path(rel_path).read_text(encoding="utf-8"))
 suffix = f"{os_name}-{arch}.tar.gz"
 asset = next(
     (
@@ -136,6 +136,7 @@ if not asset:
 print(asset["browser_download_url"])
 PY
 )"
+  rm -f "bin/release.json"
 
   curl -fsSL -H "User-Agent: PingGate" "$DOWNLOAD_URL" -o "bin/sing-box.tar.gz"
   "$VENV_DIR/bin/python" - <<'PY'
