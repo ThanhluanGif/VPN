@@ -17,6 +17,10 @@ import {
   type LocalAgentHealth,
 } from './lib/localBridge';
 import {
+  fetchLiveServersWithFallback,
+  fetchWithTimeout,
+} from './lib/liveFeedClient';
+import {
   detectCurrentDevice,
   refineDeviceWithHighEntropy,
   type DesktopPlatform,
@@ -32,13 +36,6 @@ import type {
   ProxyNode,
   RoutingMode,
 } from './types/network';
-
-interface LiveServersResponse {
-  ok: boolean;
-  nodes?: ProxyNode[];
-  verifiedAt?: string;
-  error?: string;
-}
 
 interface BackendPingResponse {
   ok: boolean;
@@ -91,24 +88,16 @@ export default function App() {
     setIsLoadingLive(true);
     setLiveError(null);
     try {
-      const endpoint = forceRefresh ? '/api/servers/live?refresh=1' : '/api/servers/live';
-      const res = await fetch(endpoint, { signal: AbortSignal.timeout(25000) });
-      const data = (await res.json()) as LiveServersResponse;
-      if (!res.ok || !data.ok || !Array.isArray(data.nodes)) {
-        setLiveError(data.error || 'Không thể tải danh sách máy chủ đang hoạt động.');
+      const result = await fetchLiveServersWithFallback(forceRefresh);
+      if (!result.ok || result.nodes.length === 0) {
+        setLiveError(
+          result.error ||
+            'Tạm thời chưa tìm thấy máy chủ công cộng nào. Bạn có thể bấm Quét lại hoặc dán link VPS cá nhân.',
+        );
         return;
       }
-      setLiveNodes(data.nodes);
-      setVerifiedAt(data.verifiedAt ?? new Date().toISOString());
-      if (data.nodes.length === 0) {
-        setLiveError(
-          'Tạm thời chưa tìm thấy node cộng đồng nào phản hồi TCP. Bạn có thể bấm Quét lại hoặc dán link VPS cá nhân.',
-        );
-      }
-    } catch {
-      setLiveError(
-        'Không kết nối được tới dịch vụ kiểm tra máy chủ. Vui lòng thử bấm Quét lại sau vài giây.',
-      );
+      setLiveNodes(result.nodes);
+      setVerifiedAt(result.verifiedAt);
     } finally {
       setIsLoadingLive(false);
     }
@@ -166,18 +155,21 @@ export default function App() {
             });
           }
         } else {
-          const res = await fetch('/api/servers/ping', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              targets: targets.slice(0, 20).map((n) => ({
-                id: n.id,
-                server: n.server,
-                port: n.port,
-              })),
-            }),
-            signal: AbortSignal.timeout(15000),
-          });
+          const res = await fetchWithTimeout(
+            '/api/servers/ping',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                targets: targets.slice(0, 20).map((n) => ({
+                  id: n.id,
+                  server: n.server,
+                  port: n.port,
+                })),
+              }),
+            },
+            15000,
+          );
           if (res.ok) {
             const data = (await res.json()) as BackendPingResponse;
             if (data.ok && Array.isArray(data.results)) {

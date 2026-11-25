@@ -338,8 +338,10 @@ export function FreeServersSection({
                             >
                               {node.latencyMs} ms
                             </span>
-                          ) : (
+                          ) : node.lastTestedAt ? (
                             <span className="text-xs text-red-400">Timeout</span>
+                          ) : (
+                            <span className="text-xs text-slate-400">Chưa đo</span>
                           )}
                         </td>
                         <td className="py-3.5 pl-3 pr-5 text-right whitespace-nowrap">
