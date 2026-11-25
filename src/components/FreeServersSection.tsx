@@ -11,6 +11,7 @@ import {
   Trash2,
   Zap,
 } from 'lucide-react';
+import type { LiveFeedSource } from '../lib/liveFeedClient';
 import { getLatencyTier } from '../lib/profiles';
 import type { ConnectionState, ProxyNode } from '../types/network';
 
@@ -21,6 +22,7 @@ interface FreeServersSectionProps {
   agentConnected: boolean;
   testingNodeIds: Record<string, boolean>;
   isLoadingLive: boolean;
+  liveFeedSource: LiveFeedSource;
   liveError: string | null;
   verifiedAt: string | null;
   copiedNodeId: string | null;
@@ -65,6 +67,7 @@ export function FreeServersSection({
   agentConnected,
   testingNodeIds,
   isLoadingLive,
+  liveFeedSource,
   liveError,
   verifiedAt,
   copiedNodeId,
@@ -84,6 +87,11 @@ export function FreeServersSection({
 
   const isAnyTesting = Object.values(testingNodeIds).some(Boolean);
   const filteredNodes = nodes.filter((node) => matchesFilter(node, filter));
+  const showDirectFeedNotice =
+    !liveError &&
+    liveFeedSource === 'direct-feed' &&
+    nodes.length > 0 &&
+    nodes.every((n) => n.latencyMs === null);
 
   function handleSubmitUri(e: React.FormEvent) {
     e.preventDefault();
@@ -216,6 +224,20 @@ export function FreeServersSection({
               >
                 Thử quét lại
               </button>
+            </div>
+          )}
+
+          {showDirectFeedNotice && (
+            <div
+              role="status"
+              className="flex flex-wrap items-center justify-between gap-3 border-b border-indigo-500/20 bg-indigo-500/10 px-5 py-3 text-xs text-indigo-200"
+            >
+              <span className="flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 shrink-0 text-indigo-300" aria-hidden="true" />
+                <span>
+                  Đang tải danh sách máy chủ thật trực tiếp từ nguồn cộng đồng. Phiên bản web tĩnh không có dịch vụ TCP nền để đo ping thay trình duyệt — hãy bấm &ldquo;Đo Ping thật&rdquo; sau khi mở PingGate Desktop trên máy để xem ping (ms) chính xác từ mạng nhà bạn.
+                </span>
+              </span>
             </div>
           )}
 

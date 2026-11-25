@@ -11,6 +11,7 @@ import {
   Split,
 } from 'lucide-react';
 import { collectActiveRoutingTargets } from '../lib/configBuilder';
+import type { LiveFeedSource } from '../lib/liveFeedClient';
 import type { LocalAgentHealth } from '../lib/localBridge';
 import { getLatencyTier } from '../lib/profiles';
 import type {
@@ -28,6 +29,7 @@ interface HeroClientCardProps {
   agentHealth: LocalAgentHealth | null;
   isProbingAgent: boolean;
   isLoadingLive: boolean;
+  liveFeedSource: LiveFeedSource;
   copiedNodeId: string | null;
   recommendedPlatformLabel: string;
   onToggleConnect: () => void;
@@ -52,6 +54,7 @@ export function HeroClientCard({
   agentHealth,
   isProbingAgent,
   isLoadingLive,
+  liveFeedSource,
   copiedNodeId,
   recommendedPlatformLabel,
   onToggleConnect,
@@ -126,7 +129,11 @@ export function HeroClientCard({
                   </span>
                   <span aria-hidden="true">·</span>
                   <span className={`font-mono font-semibold tabular-nums whitespace-nowrap ${pingColor}`}>
-                    {activeNode.latencyMs !== null ? `${activeNode.latencyMs} ms` : 'Chưa phản hồi'}
+                    {activeNode.latencyMs !== null
+                      ? `${activeNode.latencyMs} ms`
+                      : liveFeedSource === 'direct-feed'
+                        ? 'Chưa đo TCP'
+                        : 'Chưa phản hồi'}
                   </span>
                 </>
               ) : (
@@ -198,7 +205,9 @@ export function HeroClientCard({
             <p className={`mt-1 font-mono text-xs sm:text-sm font-semibold tabular-nums ${pingColor}`}>
               {activeNode?.latencyMs !== null && activeNode?.latencyMs !== undefined
                 ? `${activeNode.latencyMs} ms`
-                : '—'}
+                : liveFeedSource === 'direct-feed'
+                  ? 'Chưa đo TCP'
+                  : '—'}
             </p>
           </div>
           <div className="pl-3">

@@ -24,25 +24,43 @@ const FLAG_REGION_MAP: ReadonlyArray<[string, string]> = [
   ['🇨🇦', 'Canada'],
 ];
 
+export type LiveFeedSource = 'backend-tcp' | 'local-agent' | 'direct-feed';
+
 export interface LiveServersFetchResult {
   ok: boolean;
   nodes: ProxyNode[];
   verifiedAt: string;
-  source: 'backend-tcp' | 'direct-feed';
+  source: LiveFeedSource;
   error?: string;
 }
+
+export interface BackendPingItem {
+  id: string;
+  latencyMs: number | null;
+  resolvedIp: string | null;
+  reachable: boolean;
+}
+
+export interface BackendPingApiResponse {
+  ok?: boolean;
+  results?: BackendPingItem[];
+  measuredAt?: string;
+}
+
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export async function fetchWithTimeout(
   input: string,
   init: RequestInit,
   timeoutMs: number,
+  fetchImpl: FetchLike = globalThis.fetch,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    return await fetchImpl(input, { ...init, signal: controller.signal });
   } finally {
-    window.clearTimeout(timer);
+    globalThis.clearTimeout(timer);
   }
 }
 
@@ -115,12 +133,14 @@ function extractUriLines(text: string): string[] {
   return [];
 }
 
-async function fetchDirectPublicNodesFromBrowser(): Promise<ProxyNode[]> {
+export async function fetchDirectPublicNodesFromBrowser(
+  fetchImpl: FetchLike = globalThis.fetch,
+): Promise<ProxyNode[]> {
   const rawLines: string[] = [];
   await Promise.all(
     DIRECT_BROWSER_FEEDS.map(async (url) => {
       try {
-        const res = await fetchWithTimeout(url, { method: 'GET' }, 8000);
+        const res = await fetchWithTimeout(url, { method: 'GET' }, 8000, fetchImpl);
         if (!res.ok) return;
         const text = await res.text();
         rawLines.push(...extractUriLines(text).slice(0, 25));
@@ -158,8 +178,75 @@ async function fetchDirectPublicNodesFromBrowser(): Promise<ProxyNode[]> {
   return nodes;
 }
 
+export async function measureNodesViaBackendPing(
+  targets: ProxyNode[],
+  fetchImpl: FetchLike = globalThis.fetch,
+): Promise<{
+  ok: boolean;
+  measuredAt: string;
+  latencyById: Map<string, { latencyMs: number | null; resolvedIp: string | null }>;
+}> {
+  const latencyById = new Map<string, { latencyMs: number | null; resolvedIp: string | null }>();
+  const now = new Date().toISOString();
+  if (targets.length === 0) {
+    return { ok: false, measuredAt: now, latencyById };
+  }
+
+  try {
+    const res = await fetchWithTimeout(
+      '/api/servers/ping',
+      {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        cache: 'no-store',
+        body: JSON.stringify({
+          targets: targets.slice(0, 20).map((n) => ({
+            id: n.id,
+            server: n.server,
+            port: n.port,
+          })),
+        }),
+      },
+      15000,
+      fetchImpl,
+    );
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok || !contentType.includes('application/json')) {
+      return { ok: false, measuredAt: now, latencyById };
+    }
+
+    const data = (await res.json()) as BackendPingApiResponse;
+    if (!data.ok || !Array.isArray(data.results)) {
+      return { ok: false, measuredAt: now, latencyById };
+    }
+
+    for (const item of data.results) {
+      if (item && typeof item.id === 'string') {
+        latencyById.set(item.id, {
+          latencyMs: typeof item.latencyMs === 'number' ? item.latencyMs : null,
+          resolvedIp: typeof item.resolvedIp === 'string' ? item.resolvedIp : null,
+        });
+      }
+    }
+
+    return {
+      ok: latencyById.size > 0,
+      measuredAt: data.measuredAt ?? now,
+      latencyById,
+    };
+  } catch {
+    return { ok: false, measuredAt: now, latencyById };
+  }
+}
+
 export async function fetchLiveServersWithFallback(
   forceRefresh = false,
+  fetchImpl: FetchLike = globalThis.fetch,
 ): Promise<LiveServersFetchResult> {
   const endpoint = forceRefresh ? '/api/servers/live?refresh=1' : '/api/servers/live';
 
@@ -170,10 +257,12 @@ export async function fetchLiveServersWithFallback(
         endpoint,
         {
           method: 'GET',
+          credentials: 'same-origin',
           headers: { Accept: 'application/json' },
           cache: 'no-store',
         },
-        22000,
+        18000,
+        fetchImpl,
       );
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
@@ -196,13 +285,40 @@ export async function fetchLiveServersWithFallback(
     }
 
     if (attempt === 0) {
-      await new Promise((r) => window.setTimeout(r, 900));
+      await new Promise((r) => globalThis.setTimeout(r, 700));
     }
   }
 
   // Fallback: fetch the same real live community GitHub feeds directly in browser (CORS *)
-  const directNodes = await fetchDirectPublicNodesFromBrowser();
+  const directNodes = await fetchDirectPublicNodesFromBrowser(fetchImpl);
   if (directNodes.length > 0) {
+    // Recover real TCP latencies if /api/servers/ping is available even when /api/servers/live missed
+    const pingRecovery = await measureNodesViaBackendPing(directNodes, fetchImpl);
+    if (pingRecovery.ok) {
+      const hydrated = directNodes
+        .map((node) => {
+          const hit = pingRecovery.latencyById.get(node.id);
+          if (!hit) return node;
+          return {
+            ...node,
+            latencyMs: hit.latencyMs,
+            exitIp: hit.resolvedIp ?? node.exitIp,
+            lastTestedAt: pingRecovery.measuredAt,
+          };
+        })
+        .sort((a, b) => (a.latencyMs ?? 99999) - (b.latencyMs ?? 99999));
+
+      const hasAnyPing = hydrated.some((n) => n.latencyMs !== null);
+      if (hasAnyPing) {
+        return {
+          ok: true,
+          nodes: hydrated,
+          verifiedAt: pingRecovery.measuredAt,
+          source: 'backend-tcp',
+        };
+      }
+    }
+
     return {
       ok: true,
       nodes: directNodes,

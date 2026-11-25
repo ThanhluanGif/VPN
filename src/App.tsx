@@ -18,7 +18,8 @@ import {
 } from './lib/localBridge';
 import {
   fetchLiveServersWithFallback,
-  fetchWithTimeout,
+  measureNodesViaBackendPing,
+  type LiveFeedSource,
 } from './lib/liveFeedClient';
 import {
   detectCurrentDevice,
@@ -37,23 +38,13 @@ import type {
   RoutingMode,
 } from './types/network';
 
-interface BackendPingResponse {
-  ok: boolean;
-  results?: Array<{
-    id: string;
-    latencyMs: number | null;
-    resolvedIp: string | null;
-    reachable: boolean;
-  }>;
-  measuredAt?: string;
-}
-
 export default function App() {
   const [profiles, setProfiles] = useState<AppProfilesData>(() => loadProfilesFromStorage());
   const [detectedDevice, setDetectedDevice] = useState<DetectedDevice>(() =>
     detectCurrentDevice(),
   );
   const [liveNodes, setLiveNodes] = useState<ProxyNode[]>([]);
+  const [liveFeedSource, setLiveFeedSource] = useState<LiveFeedSource>('backend-tcp');
   const [isLoadingLive, setIsLoadingLive] = useState(true);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [verifiedAt, setVerifiedAt] = useState<string | null>(null);
@@ -97,6 +88,7 @@ export default function App() {
         return;
       }
       setLiveNodes(result.nodes);
+      setLiveFeedSource(result.source);
       setVerifiedAt(result.verifiedAt);
     } finally {
       setIsLoadingLive(false);
@@ -129,7 +121,7 @@ export default function App() {
   }, [connectionState]);
 
   const pingNodesReal = useCallback(
-    async (targets: ProxyNode[]) => {
+    async (targets: ProxyNode[], forceAgent = false) => {
       if (targets.length === 0) return;
       const flags: Record<string, boolean> = {};
       for (const node of targets) {
@@ -139,9 +131,10 @@ export default function App() {
 
       const now = new Date().toISOString();
       const latencyMap = new Map<string, { latencyMs: number | null; resolvedIp: string | null }>();
+      let measuredSuccessfully = false;
 
       try {
-        if (agentHealth?.ok) {
+        if (forceAgent || agentHealth?.ok) {
           const results = await Promise.all(
             targets.map(async (node) => ({
               id: node.id,
@@ -149,58 +142,54 @@ export default function App() {
             })),
           );
           for (const item of results) {
+            if (item.res.ok) {
+              measuredSuccessfully = true;
+            }
             latencyMap.set(item.id, {
               latencyMs: item.res.latencyMs,
               resolvedIp: null,
             });
           }
+          if (measuredSuccessfully) {
+            setLiveFeedSource('local-agent');
+            setLiveError(null);
+          }
         } else {
-          const res = await fetchWithTimeout(
-            '/api/servers/ping',
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                targets: targets.slice(0, 20).map((n) => ({
-                  id: n.id,
-                  server: n.server,
-                  port: n.port,
-                })),
-              }),
-            },
-            15000,
-          );
-          if (res.ok) {
-            const data = (await res.json()) as BackendPingResponse;
-            if (data.ok && Array.isArray(data.results)) {
-              for (const item of data.results) {
-                latencyMap.set(item.id, {
-                  latencyMs: item.latencyMs,
-                  resolvedIp: item.resolvedIp,
-                });
-              }
-            }
+          const backendRes = await measureNodesViaBackendPing(targets);
+          if (backendRes.ok) {
+            measuredSuccessfully = true;
+            backendRes.latencyById.forEach((value, key) => {
+              latencyMap.set(key, value);
+            });
+            setLiveFeedSource('backend-tcp');
+            setLiveError(null);
+          } else {
+            setLiveError(
+              'Máy chủ kiểm tra TCP nền hiện không phản hồi trong phiên bản web tĩnh này. Hãy tải & mở PingGate Desktop trên máy tính rồi bấm "Nối app máy tính" để đo ping TCP thật trực tiếp từ mạng của bạn.',
+            );
           }
         }
 
-        const applyUpdate = (list: ProxyNode[]) =>
-          list.map((node) => {
-            const hit = latencyMap.get(node.id);
-            if (!hit) return node;
-            return {
-              ...node,
-              latencyMs: hit.latencyMs,
-              exitIp: hit.resolvedIp ?? node.exitIp,
-              lastTestedAt: now,
-            };
-          });
+        if (latencyMap.size > 0) {
+          const applyUpdate = (list: ProxyNode[]) =>
+            list.map((node) => {
+              const hit = latencyMap.get(node.id);
+              if (!hit) return node;
+              return {
+                ...node,
+                latencyMs: hit.latencyMs,
+                exitIp: hit.resolvedIp ?? node.exitIp,
+                lastTestedAt: now,
+              };
+            });
 
-        setLiveNodes((prev) => applyUpdate(prev));
-        setProfiles((prev) => ({
-          ...prev,
-          nodes: applyUpdate(prev.nodes),
-        }));
-        setVerifiedAt(now);
+          setLiveNodes((prev) => applyUpdate(prev));
+          setProfiles((prev) => ({
+            ...prev,
+            nodes: applyUpdate(prev.nodes),
+          }));
+          setVerifiedAt(now);
+        }
       } finally {
         setTestingNodeIds((prev) => {
           const next = { ...prev };
@@ -307,8 +296,11 @@ export default function App() {
       }
       setAgentNotice({
         type: 'success',
-        text: `Đã liên kết với ứng dụng PingGate trên máy tính (${res.health.platform}). Bạn có thể bật/tắt VPN thật cho game ngay trên website này.`,
+        text: `Đã liên kết với ứng dụng PingGate trên máy tính (${res.health.platform}). Đang đo TCP ping thực tế trực tiếp từ mạng của bạn...`,
       });
+      if (allNodes.length > 0) {
+        void pingNodesReal(allNodes, true);
+      }
     } else {
       setAgentHealth(null);
       setConnectionState('disconnected');
@@ -521,6 +513,7 @@ export default function App() {
                   agentHealth={agentHealth}
                   isProbingAgent={isProbingAgent}
                   isLoadingLive={isLoadingLive}
+                  liveFeedSource={liveFeedSource}
                   copiedNodeId={copiedNodeId}
                   recommendedPlatformLabel={
                     detectedDevice.os === 'linux'
@@ -544,6 +537,7 @@ export default function App() {
           agentConnected={Boolean(agentHealth?.ok)}
           testingNodeIds={testingNodeIds}
           isLoadingLive={isLoadingLive}
+          liveFeedSource={liveFeedSource}
           liveError={liveError}
           verifiedAt={verifiedAt}
           copiedNodeId={copiedNodeId}

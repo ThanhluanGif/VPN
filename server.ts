@@ -1,4 +1,5 @@
 import dns from 'node:dns/promises';
+import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,24 +34,48 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 let liveNodesCache: { fetchedAt: number; nodes: ProxyNode[] } | null = null;
 let inFlightLiveFetch: Promise<ProxyNode[]> | null = null;
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    promise
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+  });
+}
+
 async function resolvePublicIp(host: string): Promise<string | null> {
   const cleaned = host.trim().replace(/^\[|\]$/g, '');
   if (!cleaned || cleaned.length > 253) return null;
   if (net.isIP(cleaned)) {
     return isPublicIpAddress(cleaned) ? cleaned : null;
   }
-  try {
-    const record = await dns.lookup(cleaned, { family: 4 });
-    return isPublicIpAddress(record.address) ? record.address : null;
-  } catch {
-    return null;
+
+  // Prefer async c-ares dns.resolve4 so concurrent checks never block Node's 4-thread libuv pool
+  const ipv4List = await withTimeout(dns.resolve4(cleaned), 1200);
+  if (ipv4List && ipv4List.length > 0) {
+    if (ipv4List.some((ip) => !isPublicIpAddress(ip))) {
+      return null;
+    }
+    return ipv4List[0];
   }
+
+  const fallback = await withTimeout(dns.lookup(cleaned, { family: 4 }), 1200);
+  if (fallback && isPublicIpAddress(fallback.address)) {
+    return fallback.address;
+  }
+  return null;
 }
 
 async function measurePublicTcpPing(
   host: string,
   port: number,
-  timeoutMs = 1700,
+  timeoutMs = 1500,
 ): Promise<{ latencyMs: number | null; resolvedIp: string | null }> {
   if (!isValidPort(port)) {
     return { latencyMs: null, resolvedIp: null };
@@ -257,15 +282,15 @@ async function runLiveNodeVerification(): Promise<ProxyNode[]> {
     if (parsedCandidates.length >= 60) break;
   }
 
-  // Run bounded concurrent real TCP handshake verification
+  // Run bounded concurrent real TCP handshake verification (25 at once completes in ~1.5s)
   const verified: ProxyNode[] = [];
-  const batchSize = 15;
+  const batchSize = 25;
 
   for (let i = 0; i < parsedCandidates.length && verified.length < 10; i += batchSize) {
     const batch = parsedCandidates.slice(i, i + batchSize);
     const results = await Promise.all(
       batch.map(async (node) => {
-        const check = await measurePublicTcpPing(node.server, node.port, 1600);
+        const check = await measurePublicTcpPing(node.server, node.port, 1400);
         if (check.latencyMs === null || !check.resolvedIp) return null;
         const resolvedRegion = inferRegionWithFlags(node.name, node.region);
         return {
@@ -299,14 +324,38 @@ async function runLiveNodeVerification(): Promise<ProxyNode[]> {
       fetchedAt: Date.now(),
       nodes: polished,
     };
+    return polished;
   }
 
-  return polished;
+  // If upstream feeds temporarily stall, fall back to last verified cache instead of dropping pings
+  if (liveNodesCache && liveNodesCache.nodes.length > 0) {
+    return liveNodesCache.nodes;
+  }
+
+  return [];
 }
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '64kb' }));
+
+  const distDir = path.resolve(__dirname, 'dist');
+  const distIndexPath = path.join(distDir, 'index.html');
+  const hasBuiltDist = fs.existsSync(distIndexPath);
+  const isProductionRuntime =
+    process.env.NODE_ENV === 'production' ||
+    process.argv.includes('--prod') ||
+    (Boolean(process.env.PORT) && process.env.PORT !== '3000' && hasBuiltDist);
+
+  app.get('/api/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      mode: isProductionRuntime ? 'production' : 'development',
+      cachedNodes: liveNodesCache?.nodes.length ?? 0,
+    });
+  });
 
   app.get('/api/servers/live', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -315,6 +364,7 @@ async function startServer() {
       const nodes = await fetchAndVerifyLiveNodes(forceRefresh);
       res.json({
         ok: true,
+        source: 'backend-tcp',
         nodes,
         verifiedAt: new Date().toISOString(),
       });
@@ -327,6 +377,7 @@ async function startServer() {
   });
 
   app.post('/api/servers/ping', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     const targets = req.body?.targets;
     if (!Array.isArray(targets) || targets.length === 0 || targets.length > 20) {
       res.status(400).json({
@@ -348,7 +399,7 @@ async function startServer() {
         if (!id || !server || !isValidPort(port)) {
           return { id, latencyMs: null, resolvedIp: null, reachable: false };
         }
-        const check = await measurePublicTcpPing(server, port, 2000);
+        const check = await measurePublicTcpPing(server, port, 1800);
         return {
           id,
           latencyMs: check.latencyMs,
@@ -365,18 +416,25 @@ async function startServer() {
     });
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distDir = path.resolve(__dirname, 'dist');
+  let mountedVite = false;
+  if (!isProductionRuntime) {
+    try {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+      mountedVite = true;
+    } catch {
+      mountedVite = false;
+    }
+  }
+
+  if (!mountedVite) {
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+      res.sendFile(distIndexPath);
     });
   }
 
@@ -385,14 +443,18 @@ async function startServer() {
     portArgIdx !== -1 && process.argv[portArgIdx + 1]
       ? Number(process.argv[portArgIdx + 1])
       : NaN;
-  const PORT = Number.isInteger(cliPort) && cliPort > 0
-    ? cliPort
-    : process.env.NODE_ENV === 'production'
-      ? Number(process.env.PORT || 3000)
-      : 3000;
+  const envPort = Number(process.env.PORT);
+  const PORT =
+    Number.isInteger(cliPort) && cliPort > 0
+      ? cliPort
+      : Number.isInteger(envPort) && envPort > 0
+        ? envPort
+        : 3000;
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`PingGate server listening on http://0.0.0.0:${PORT}`);
+    console.log(
+      `PingGate server listening on http://0.0.0.0:${PORT} (${mountedVite ? 'dev-vite' : 'static-dist'})`,
+    );
     // Pre-warm TCP-verified live community nodes so first visitor load is instant
     void fetchAndVerifyLiveNodes(false).catch(() => {});
   });
